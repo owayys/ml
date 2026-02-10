@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import math
 
 # hyperparameters
 batch_size = 16
@@ -61,6 +62,23 @@ def estimate_loss():
     model.train()
     return out
 
+def precompute_freqs(dim, max_seq_len, base=10000):
+    freqs = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+    t = torch.arange(max_seq_len, device=device, dtype=torch.float32)
+    freqs = torch.outer(t, freqs)
+    return torch.cat([freqs, freqs], dim=-1)
+
+def rotate_half(x):
+    x1, x2 = x[..., :x.shape[-1]//2], x[..., x.shape[-1]//2:]
+    return torch.cat([-x2, x1], dim=-1)
+
+def apply_rope(x, freqs):
+    # x: (B, T, C)
+    # freqs: (T, C)
+    cos_vals = torch.cos(freqs)
+    sin_vals = torch.sin(freqs)
+    return (x * cos_vals) + (rotate_half(x) * sin_vals)
+
 class AttentionHead(nn.Module):
    
   def __init__(self, head_size):
@@ -69,6 +87,7 @@ class AttentionHead(nn.Module):
       self.query = nn.Linear(n_embd, head_size, bias=False)
       self.value = nn.Linear(n_embd, head_size, bias=False)
       self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+      self.register_buffer('freqs', precompute_freqs(head_size, block_size))
 
       self.dropout = nn.Dropout(dropout)
 
@@ -76,6 +95,10 @@ class AttentionHead(nn.Module):
       B, T, C = x.shape
       k = self.key(x)
       q = self.query(x)
+      
+      # Apply RoPE to query and key
+      q = apply_rope(q, self.freqs[:T])
+      k = apply_rope(k, self.freqs[:T])
 
       wei = q @ k.transpose(-2, -1) # (B, T, 16) @ (B, 16, T) ---> (B, T, T)
       wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
@@ -135,7 +158,7 @@ class BigramLM(nn.Module):
     super().__init__()
 
     self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
-    self.position_embedding_table = nn.Embedding(block_size, n_embd)
+    # No position embedding table needed for RoPE
     # self.sa_heads = MHA(4, n_embd//4)
     # self.ffwd = FFN(n_embd)
     self.blocks = nn.Sequential(*[Block(n_embd, n_heads) for _ in range(n_layer)])
@@ -146,8 +169,9 @@ class BigramLM(nn.Module):
     B, T = idx.shape
 
     token_emb = self.token_embedding_table(idx)
-    position_emb = self.position_embedding_table(torch.arange(T, device=device))
-    x = token_emb + position_emb
+    # With RoPE, we don't add positional embeddings here
+    # The positional information is applied in the attention mechanism
+    x = token_emb
     # x = self.sa_heads(x)
     # x = self.ffwd(x)
     x = self.blocks(x)
